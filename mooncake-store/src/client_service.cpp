@@ -3,6 +3,8 @@
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
 
+#include <sstream>
+
 #include "ascii_string.h"
 #include "allocator.h"
 #include "segment.h"
@@ -400,6 +402,14 @@ FinalizeDecision DetermineFinalizeDecision(
         slice_size += slice.size;
     }
     return slice_size;
+}
+
+[[nodiscard]] static uint64_t DurationUsBetween(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count());
 }
 
 Client::Client(const std::string& local_hostname,
@@ -2215,20 +2225,44 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            uint64_t total_bytes = 0;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                for (const auto& slice : batched_slices[i]) {
+                    total_bytes += slice.size;
+                }
+            }
+            LOG(INFO) << "[BatchUpsertTiming] keys=" << keys.size()
+                      << " bytes=" << total_bytes
+                      << " status=error complete=false"
+                      << " timing_scope=prefer_same_node_not_started"
+                      << " phase_status=not_started";
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        const auto batch_begin = std::chrono::steady_clock::now();
         StartBatchUpsert(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
+        const auto after_start_batch_put = std::chrono::steady_clock::now();
+        return BatchWriteWhenPreferSameNode(ops, true, batch_begin,
+                                            after_start_batch_put);
     }
 
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        for (const auto& slice : batched_slices[i]) {
+            total_bytes += slice.size;
+        }
+    }
+    const auto batch_begin = std::chrono::steady_clock::now();
     StartBatchUpsert(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
+    const auto after_start_batch_put = std::chrono::steady_clock::now();
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    const auto after_submit_transfers = std::chrono::steady_clock::now();
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
+    const auto after_wait_transfers = std::chrono::steady_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -2237,7 +2271,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    const auto batch_end = std::chrono::steady_clock::now();
+    size_t failed_keys = 0;
+    auto results = CollectResults(ops, failed_keys);
+    LogBatchWriteTiming(results.size(), true, total_bytes, failed_keys,
+                        batch_begin, after_start_batch_put,
+                        after_start_batch_put, after_submit_transfers,
+                        after_wait_transfers, batch_end, "normal_full");
+    return results;
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -3234,9 +3275,10 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
-    const std::vector<PutOperation>& ops) {
+    const std::vector<PutOperation>& ops, size_t& failed_keys) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
+    failed_keys = 0;
 
     int no_available_handle_count = 0;
     for (const auto& op : ops) {
@@ -3252,6 +3294,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                 results.back() = {};
                 continue;
             }
+            ++failed_keys;
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
@@ -3272,6 +3315,51 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     }
 
     return results;
+}
+
+// The original signature stays exported, so that the library only adds names and never removes one; no caller in
+// this file uses it.
+std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
+    const std::vector<PutOperation>& ops) {
+    size_t failed_keys = 0;
+    return CollectResults(ops, failed_keys);
+}
+
+void Client::LogBatchWriteTiming(
+    size_t keys, bool is_upsert, uint64_t total_bytes, size_t failed_keys,
+    std::chrono::steady_clock::time_point batch_begin,
+    std::chrono::steady_clock::time_point after_start_batch_put,
+    std::chrono::steady_clock::time_point submit_begin,
+    std::chrono::steady_clock::time_point after_submit_transfers,
+    std::chrono::steady_clock::time_point after_wait_transfers,
+    std::chrono::steady_clock::time_point batch_end,
+    const char* timing_scope) const {
+    // Unknown start (the original-signature BatchWriteWhenPreferSameNode): no phase1 and no total, complete=false.
+    // The fields are left out rather than written as 0, so that a reader finds them missing.
+    const bool start_known =
+        batch_begin != std::chrono::steady_clock::time_point::min() &&
+        after_start_batch_put != std::chrono::steady_clock::time_point::min();
+    std::ostringstream phase1, total;
+    if (start_known) {
+        phase1 << " phase1_start_batch_put_us="
+               << DurationUsBetween(batch_begin, after_start_batch_put);
+        total << " total_us=" << DurationUsBetween(batch_begin, batch_end);
+    }
+    LOG(INFO) << (is_upsert ? "[BatchUpsertTiming]" : "[BatchPutTiming]")
+              << " keys=" << keys << " bytes=" << total_bytes
+              << phase1.str()
+              << " phase2_submit_transfers_us="
+              << DurationUsBetween(submit_begin, after_submit_transfers)
+              << " phase3_wait_transfers_us="
+              << DurationUsBetween(after_submit_transfers,
+                                   after_wait_transfers)
+              << " phase4_finalize_batch_put_us="
+              << DurationUsBetween(after_wait_transfers, batch_end)
+              << total.str()
+              << " timing_scope=" << timing_scope
+              << " status=" << (failed_keys == 0 ? "ok" : "error")
+              << " complete=" << (start_known ? "true" : "false")
+              << " failed_keys=" << failed_keys;
 }
 
 void Client::StageWriteBuffersForRemoteReplicas(
@@ -3297,8 +3385,19 @@ void Client::StageWriteBuffersForRemoteReplicas(
     }
 }
 
+// The original signature stays exported (see CollectResults). The two time points its callers take before the call
+// are not known here: they are passed as time_point::min(), and the timing line then has no phase1 and no total.
 std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     std::vector<PutOperation>& ops, bool is_upsert) {
+    return BatchWriteWhenPreferSameNode(
+        ops, is_upsert, std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min());
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
+    std::vector<PutOperation>& ops, bool is_upsert,
+    std::chrono::steady_clock::time_point batch_begin,
+    std::chrono::steady_clock::time_point after_start_batch_put) {
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -3361,7 +3460,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
                     << " transfers for key " << merged_ops.back().key;
         }
     }
+    const auto after_submit_transfers = std::chrono::steady_clock::now();
     WaitForTransfers(merged_ops);
+    const auto after_wait_transfers = std::chrono::steady_clock::now();
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
@@ -3399,7 +3500,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     } else {
         FinalizeBatchPut(ops);
     }
-    return CollectResults(ops);
+    const auto batch_end = std::chrono::steady_clock::now();
+
+    uint64_t total_bytes = 0;
+    for (const auto& op : ops) {
+        for (const auto& slice : op.slices) {
+            total_bytes += slice.size;
+        }
+    }
+    size_t failed_keys = 0;
+    auto results = CollectResults(ops, failed_keys);
+    LogBatchWriteTiming(results.size(), is_upsert, total_bytes, failed_keys,
+                        batch_begin, after_start_batch_put, t0,
+                        after_submit_transfers, after_wait_transfers, batch_end,
+                        "prefer_same_node_full");
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
@@ -3421,20 +3536,46 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            uint64_t total_bytes = 0;
+            for (const auto& op : ops) {
+                for (const auto& slice : op.slices) {
+                    total_bytes += slice.size;
+                }
+            }
+            LOG(INFO) << "[BatchPutTiming] keys=" << keys.size()
+                      << " bytes=" << total_bytes
+                      << " status=error complete=false"
+                      << " timing_scope=prefer_same_node_not_started"
+                      << " phase_status=not_started";
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        const auto prefer_begin = std::chrono::steady_clock::now();
         StartBatchPut(ops, client_cfg);
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, false);
+        const auto after_start_batch_put = std::chrono::steady_clock::now();
+        return BatchWriteWhenPreferSameNode(ops, false, prefer_begin,
+                                            after_start_batch_put);
     }
+
+    uint64_t total_bytes = 0;
+    for (const auto& op : ops) {
+        for (const auto& slice : op.slices) {
+            total_bytes += slice.size;
+        }
+    }
+
+    const auto batch_begin = std::chrono::steady_clock::now();
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
+    const auto after_start_batch_put = std::chrono::steady_clock::now();
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    const auto after_submit_transfers = std::chrono::steady_clock::now();
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
+    const auto after_wait_transfers = std::chrono::steady_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3443,7 +3584,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    const auto batch_end = std::chrono::steady_clock::now();
+
+    size_t failed_keys = 0;
+    auto results = CollectResults(ops, failed_keys);
+    LogBatchWriteTiming(results.size(), false, total_bytes, failed_keys,
+                        batch_begin, after_start_batch_put,
+                        after_start_batch_put, after_submit_transfers,
+                        after_wait_transfers, batch_end, "normal_full");
+
+    return results;
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
