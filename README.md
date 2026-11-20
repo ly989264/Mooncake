@@ -132,22 +132,26 @@ Mooncake Store is a high-performance distributed key-value cache storage engine 
 
 #### Store timing diagnostics
 
-This instrumentation branch adds INFO-level `[BatchPutTiming]` observations
-without changing the original calls, results, or native metric expressions.
-The shared prefer-same-node write path uses `[BatchUpsertTiming]` for Upsert.
+This instrumentation branch records the native timing of `Client::BatchPut` and
+`Client::BatchUpsert` without changing the original calls, results, or native metric
+expressions. The records (`mc_batch_put`, `mc_batch_upsert`) are written to files under
+`/data/pd-diag/logs/mooncake/`, not through glog or stderr; see
+[Native Batch Write Timing](docs/source/getting_started/observability.md#native-batch-write-timing)
+for the file layout, rotation, retention, and the `MC_PD_TIMING` and `PD_DIAG_LEVEL`
+switches.
 
 | `timing_scope` | Measured range |
 | --- | --- |
 | `normal_full` | `StartBatchPut` through `FinalizeBatchPut`, in four phases. Phase 1 includes buffer staging; phase 3 includes `SubmitDfsWrites`. |
-| `phase1_only` | Prefer-same-node `StartBatchPut` and buffer staging. No `total_us` is emitted for this record. |
-| `prefer_same_node_remaining` | Grouping/submission, transfer wait, and result propagation/DFS writes/finalization. `total_us` covers only these phases 2–4, not phase 1. |
+| `prefer_same_node_full` | The prefer-same-node path: phase 1 on the caller side, then grouping/submission, transfer wait, and result propagation/DFS writes/finalization. `total_us` spans phase 1 through finalization. The original-signature `BatchWriteWhenPreferSameNode(ops, is_upsert)` also records this scope, without `phase1_start_batch_put_us` and `total_us`, and with `complete=false`. |
+| `prefer_same_node_not_started` | The configuration check rejected the write before phase 1: `status=error`, `complete=false`, `phase_status=not_started`, keys and bytes, no phase or total durations. |
 
-These host intervals end before result collection and their timing-log emission;
-they are not full API latency or additive TTFT components. `keys` and `bytes`
-describe operation counts and slice lengths, not successful transfers or measured
-wire traffic.
+These host intervals end before result collection and record emission;
+they are not full API latency or additive TTFT components. `submitted_keys` and
+`submitted_bytes` describe operation counts and slice lengths, not successful transfers
+or measured wire traffic.
 Interrupted calls may lack completion records. Clock reads, slice counting, and
-logging add overhead; they do not introduce transfers, retries, or device waits.
+record formatting add overhead; they do not introduce transfers, retries, or device waits.
 
 </details>
 

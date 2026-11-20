@@ -14,6 +14,10 @@
 #include <sstream>
 #include <vector>
 #include <regex>
+#include <algorithm>
+#include <fstream>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
@@ -137,27 +141,65 @@ class ClientIdCaptureSink : public google::LogSink {
     }
 };
 
-class BatchWriteTimingCaptureSink : public google::LogSink {
-   public:
-    BatchWriteTimingCaptureSink() { google::AddLogSink(this); }
-    ~BatchWriteTimingCaptureSink() override { google::RemoveLogSink(this); }
+// The batch-write timing records go to files of their own (not glog): point them at a private directory for this
+// test binary before the first record, and read back this thread's records by native_tid.
+const std::string& BatchWriteTimingDir() {
+    static const std::string dir = [] {
+        std::string d = (std::filesystem::temp_directory_path() /
+                         ("mooncake-batch-timing-" + std::to_string(getpid())))
+                            .string();
+        setenv("MC_PD_TIMING_DIR", d.c_str(), 1);
+        return d;
+    }();
+    return dir;
+}
+[[maybe_unused]] const bool kBatchWriteTimingDirSet = !BatchWriteTimingDir().empty();
 
-    void send(google::LogSeverity, const char*, const char*, int,
-              const struct ::tm*, const char* message,
-              size_t message_len) override {
-        // Other client/background threads must not mutate this call's capture.
-        if (std::this_thread::get_id() != owner_) return;
-        std::string_view text(message, message_len);
-        if (text.find("[BatchPutTiming]") != std::string_view::npos ||
-            text.find("[BatchUpsertTiming]") != std::string_view::npos) {
-            records.emplace_back(text);
+class BatchWriteTimingCapture {
+   public:
+    BatchWriteTimingCapture() : baseline_(Matching().size()) {}
+
+    // Waits (up to 5 s; the writer flushes every 200 ms) until `expected` new records of this thread are on disk.
+    void Collect(size_t expected) {
+        for (int i = 0; i < 100; ++i) {
+            auto all = Matching();
+            if (all.size() >= baseline_ + expected) {
+                records.assign(all.begin() + baseline_, all.end());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        auto all = Matching();
+        records.assign(all.begin() + std::min(baseline_, all.size()), all.end());
     }
 
     std::vector<std::string> records;
 
    private:
-    const std::thread::id owner_ = std::this_thread::get_id();
+    std::vector<std::string> Matching() const {
+        std::vector<std::string> out;
+        const std::string tid = "\"native_tid\":" + std::to_string(static_cast<long>(syscall(SYS_gettid))) + ",";
+        std::error_code ec;
+        std::vector<std::filesystem::path> files;
+        for (const auto& e : std::filesystem::directory_iterator(BatchWriteTimingDir(), ec)) {
+            if (e.path().filename().string().rfind("mc.", 0) == 0) files.push_back(e.path());
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& f : files) {
+            std::ifstream in(f);
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.find(tid) != std::string::npos &&
+                    (line.find("\"event\":\"mc_batch_put\"") != std::string::npos ||
+                     line.find("\"event\":\"mc_batch_upsert\"") != std::string::npos)) {
+                    out.push_back(line.substr(line.find('{')));
+                }
+            }
+        }
+        return out;
+    }
+
+    size_t baseline_;
 };
 
 class ClientIntegrationTest : public ::testing::Test {
@@ -673,16 +715,18 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
     const std::array<const char*, 4> stages{
         "phase1_start_batch_put_us", "phase2_submit_transfers_us",
         "phase3_wait_transfers_us", "phase4_finalize_batch_put_us"};
+    // One flat JSON object of numbers, strings and booleans: "key":value pairs, values without commas.
     auto parse = [](const std::string& record) {
         std::unordered_map<std::string, std::string> fields;
-        std::istringstream stream(record);
+        std::string body = record.substr(1, record.size() - 2);
+        std::istringstream stream(body);
         std::string token;
-        while (stream >> token) {
-            auto separator = token.find('=');
-            if (separator != std::string::npos) {
-                fields.emplace(token.substr(0, separator),
-                               token.substr(separator + 1));
-            }
+        while (std::getline(stream, token, ',')) {
+            auto separator = token.find("\":");
+            if (separator == std::string::npos || token.empty() || token[0] != '"') continue;
+            std::string value = token.substr(separator + 2);
+            if (!value.empty() && value.front() == '"') value = value.substr(1, value.size() - 2);
+            fields.emplace(token.substr(1, separator - 1), value);
         }
         return fields;
     };
@@ -696,19 +740,18 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
         // The repeated put is successful even when its native result is
         // OBJECT_ALREADY_EXISTS. Each invocation still owns exactly one record.
         for (bool upsert : {false, false, true}) {
-            BatchWriteTimingCaptureSink sink;
+            BatchWriteTimingCapture sink;
             auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
                                   : test_client_->BatchPut(keys, slices, config);
             ASSERT_EQ(results.size(), 1);
             ASSERT_TRUE(results[0]);
+            sink.Collect(1);
             ASSERT_EQ(sink.records.size(), 1);
             const auto& record = sink.records[0];
-            EXPECT_EQ(record.find(upsert ? "[BatchUpsertTiming]"
-                                         : "[BatchPutTiming]"),
-                      0);
             auto fields = parse(record);
-            EXPECT_EQ(fields.at("keys"), "1");
-            EXPECT_EQ(fields.at("bytes"), std::to_string(value.size()));
+            EXPECT_EQ(fields.at("event"), upsert ? "mc_batch_upsert" : "mc_batch_put");
+            EXPECT_EQ(fields.at("submitted_keys"), "1");
+            EXPECT_EQ(fields.at("submitted_bytes"), std::to_string(value.size()));
             EXPECT_EQ(fields.at("status"), "ok");
             EXPECT_EQ(fields.at("complete"), "true");
             EXPECT_EQ(fields.at("failed_keys"), "0");
@@ -732,7 +775,7 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         };
         for (bool upsert : {false, true}) {
-            BatchWriteTimingCaptureSink sink;
+            BatchWriteTimingCapture sink;
             auto results =
                 upsert ? test_client_->BatchUpsert(failed_keys, slices, config,
                                                    fail_staging)
@@ -741,6 +784,7 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
             ASSERT_EQ(results.size(), 1);
             ASSERT_FALSE(results[0]);
             EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+            sink.Collect(1);
             ASSERT_EQ(sink.records.size(), 1);
             auto fields = parse(sink.records[0]);
             EXPECT_EQ(fields.at("status"), "error");
@@ -752,16 +796,17 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
         config.prefer_alloc_in_same_node = true;
         config.replica_num = 2;
         for (bool upsert : {false, true}) {
-            BatchWriteTimingCaptureSink sink;
+            BatchWriteTimingCapture sink;
             auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
                                   : test_client_->BatchPut(keys, slices, config);
             ASSERT_EQ(results.size(), 1);
             ASSERT_FALSE(results[0]);
             EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+            sink.Collect(1);
             ASSERT_EQ(sink.records.size(), 1);
             auto fields = parse(sink.records[0]);
-            EXPECT_EQ(fields.at("keys"), "1");
-            EXPECT_EQ(fields.at("bytes"), std::to_string(value.size()));
+            EXPECT_EQ(fields.at("submitted_keys"), "1");
+            EXPECT_EQ(fields.at("submitted_bytes"), std::to_string(value.size()));
             EXPECT_EQ(fields.at("status"), "error");
             EXPECT_EQ(fields.at("complete"), "false");
             EXPECT_EQ(fields.at("timing_scope"), "prefer_same_node_not_started");

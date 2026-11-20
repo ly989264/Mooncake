@@ -226,9 +226,34 @@ client HTTP server remains enabled while metrics are disabled, `/metrics` and
 ## Native Batch Write Timing
 
 Each completed `Client::BatchPut` or `Client::BatchUpsert` invocation emits one
-`[BatchPutTiming]` or `[BatchUpsertTiming]` line. The forwarding overload does not
-emit a second line. Records carry `keys`, `bytes`, four microsecond phase fields,
-`total_us`, `timing_scope`, `status`, `complete`, and `failed_keys`.
+`mc_batch_put` or `mc_batch_upsert` record. The forwarding overload does not emit a
+second record. Records are not written through glog or stderr; they go to files of
+their own:
+
+- Directory: `/data/pd-diag/logs/mooncake/` (`MC_PD_TIMING_DIR` overrides it).
+- Files: `mc.<start time>.<pid>.<seq>.log`, one per process. A file that reaches
+  256 MiB is closed and the next `seq` is opened; files are never renamed. Files of
+  this name pattern older than 12 hours are deleted whenever a file is opened and
+  every 10 minutes, including files left by other processes.
+- Lines: `<local ISO time> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] {json}`.
+  The first line of a file is a `pd_file_open` record; every minute an
+  `mc_timing_stats` record carries `written`, `dropped`, and `queue_max`.
+- Record fields: `wall_ns` (UTC nanoseconds, read inside the call after
+  finalization), `pid`, `native_tid` (the calling thread's `gettid()`),
+  `submitted_keys`, `submitted_bytes`, four microsecond phase fields, `total_us`,
+  `timing_scope`, `status`, `complete`, and `failed_keys`.
+- Switches: nothing is written when `MC_PD_TIMING=0`, or when `PD_DIAG_LEVEL` is
+  `1` or `2`. `PD_DIAG_LEVEL` unset, empty, `3`, or any other value means level 3.
+  There is no fallback to stderr.
+- The calling thread only formats the record and puts it into a bounded ring of
+  16384 records; a full ring drops the record and counts it. One detached writer
+  thread per process writes every 200 ms without `fsync`; the last records (under
+  200 ms) are lost when the process exits. After `fork()`, the child's first record
+  starts its own writer and file.
+- If the directory cannot be created or a file cannot be opened, the records are
+  dropped and counted, and a single glog `WARNING` says so; the write call itself is
+  never blocked or failed.
+
 Clocks use `steady_clock`; durations are converted directly to integer
 microseconds without rounding intermediate time points.
 
@@ -250,8 +275,8 @@ The original native latency metric keeps its existing boundaries and placement.
 object is successful for Put, matching CollectResults. `complete=true` means all
 four clock ranges were measured, not that all keys succeeded. Configuration
 rejection before phase 1 emits one `status=error complete=false` record with
-`timing_scope=prefer_same_node_not_started`, `phase_status=not_started`, keys and
-bytes, and no fabricated phase/total durations. An exception escaping the call
+`timing_scope=prefer_same_node_not_started`, `phase_status=not_started`,
+`submitted_keys` and `submitted_bytes`, and no fabricated phase/total durations. An exception escaping the call
 does not produce a completed timing record. The original-signature
 `BatchWriteWhenPreferSameNode(ops, is_upsert)` stays exported so that no name is
 removed from the library; nothing in this build calls it. It does not know the two
