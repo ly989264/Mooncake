@@ -904,6 +904,17 @@ class Client {
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(
+        const std::vector<PutOperation>& ops, size_t& failed_keys);
+    void LogBatchWriteTiming(
+        size_t keys, bool is_upsert, uint64_t total_bytes, size_t failed_keys,
+        std::chrono::steady_clock::time_point batch_begin,
+        std::chrono::steady_clock::time_point after_start_batch_put,
+        std::chrono::steady_clock::time_point submit_begin,
+        std::chrono::steady_clock::time_point after_submit_transfers,
+        std::chrono::steady_clock::time_point after_wait_transfers,
+        std::chrono::steady_clock::time_point batch_end,
+        const char* timing_scope) const;
 
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
@@ -912,6 +923,10 @@ class Client {
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert,
+        std::chrono::steady_clock::time_point batch_begin,
+        std::chrono::steady_clock::time_point after_start_batch_put);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,

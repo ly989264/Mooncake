@@ -222,3 +222,65 @@ running.
 Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
+
+## Native Batch Write Timing
+
+Each completed `Client::BatchPut` or `Client::BatchUpsert` invocation emits one
+`mc_batch_put` or `mc_batch_upsert` record. The forwarding overload does not emit a
+second record. Records are not written through glog or stderr; they go to files of
+their own:
+
+- Directory: `/data/pd-diag/logs/mooncake/` (`MC_PD_TIMING_DIR` overrides it).
+- Files: `mc.<start time>.<pid>.<seq>.log`, one per process. A file that reaches
+  256 MiB is closed and the next `seq` is opened; files are never renamed. Files of
+  this name pattern older than 12 hours are deleted whenever a file is opened and
+  every 10 minutes, including files left by other processes.
+- Lines: `<local ISO time> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] {json}`.
+  The first line of a file is a `pd_file_open` record; every minute an
+  `mc_timing_stats` record carries `written`, `dropped`, and `queue_max`.
+- Record fields: `wall_ns` (UTC nanoseconds, read inside the call after
+  finalization), `pid`, `native_tid` (the calling thread's `gettid()`),
+  `submitted_keys`, `submitted_bytes`, four microsecond phase fields, `total_us`,
+  `timing_scope`, `status`, `complete`, and `failed_keys`.
+- Switches: nothing is written when `MC_PD_TIMING=0`, or when `PD_DIAG_LEVEL` is
+  `1` or `2`. `PD_DIAG_LEVEL` unset, empty, `3`, or any other value means level 3.
+  There is no fallback to stderr.
+- The calling thread only formats the record and puts it into a bounded ring of
+  16384 records; a full ring drops the record and counts it. One detached writer
+  thread per process writes every 200 ms without `fsync`; the last records (under
+  200 ms) are lost when the process exits. After `fork()`, the child's first record
+  starts its own writer and file.
+- If the directory cannot be created or a file cannot be opened, the records are
+  dropped and counted, and a single glog `WARNING` says so; the write call itself is
+  never blocked or failed.
+
+Clocks use `steady_clock`; durations are converted directly to integer
+microseconds without rounding intermediate time points.
+
+| Field | `normal_full` | `prefer_same_node_full` |
+|-------|---------------|------------------------|
+| `phase1_start_batch_put_us` | StartBatchPut/StartBatchUpsert and buffer staging | Same caller-side boundaries |
+| `phase2_submit_transfers_us` | End of phase 1 through SubmitTransfers | Helper entry through grouping and merged transfer submission |
+| `phase3_wait_transfers_us` | WaitForTransfers and SubmitDfsWrites | WaitForTransfers on merged operations only |
+| `phase4_finalize_batch_put_us` | Native metric observation and finalization | Result propagation to original operations, SubmitDfsWrites, native metric observation, and finalization |
+
+The historical field names are shared by Put and Upsert; they do not imply
+identical work in both timing scopes. `total_us` spans the original phase-1
+start through finalization, including the caller/helper gap in the preferred-node
+path. It is an outer range, not a fifth phase. Configuration, operation creation,
+checksum computation, summary logging, and CollectResults are outside that range.
+The original native latency metric keeps its existing boundaries and placement.
+
+`status` describes the final per-key results (`ok` or `error`); an already-existing
+object is successful for Put, matching CollectResults. `complete=true` means all
+four clock ranges were measured, not that all keys succeeded. Configuration
+rejection before phase 1 emits one `status=error complete=false` record with
+`timing_scope=prefer_same_node_not_started`, `phase_status=not_started`,
+`submitted_keys` and `submitted_bytes`, and no fabricated phase/total durations. An exception escaping the call
+does not produce a completed timing record. The original-signature
+`BatchWriteWhenPreferSameNode(ops, is_upsert)` stays exported so that no name is
+removed from the library; nothing in this build calls it. It does not know the two
+time points its callers take before the call, so its record has phases 2-4, no
+`phase1_start_batch_put_us` and no `total_us` (left out, not 0), and
+`complete=false`. Apart from that, no partial-phase timing lines or
+time/log-neighbor reconstruction are used.

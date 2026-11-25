@@ -130,6 +130,29 @@ Mooncake Store is a high-performance distributed key-value cache storage engine 
 
 - **Broad ecosystem adoption.** Mooncake Store is used across the LLM systems ecosystem as a high-performance distributed storage backend for KV caches, hidden states, and model weights. It supports integrations with [SGLang's Hierarchical KV Caching](https://lmsys.org/blog/2025-09-10-sglang-hicache/), [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html), and [LMCache](https://kvcache-ai.github.io/Mooncake/deployment/integrations/lmcache/index.html), and has been adopted by systems such as [TorchSpec](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) and [TransferQueue](https://github.com/Ascend/TransferQueue) to decouple inference, training, and reinforcement-learning workloads through efficient state management and asynchronous data movement.
 
+#### Store timing diagnostics
+
+This instrumentation branch records the native timing of `Client::BatchPut` and
+`Client::BatchUpsert` without changing the original calls, results, or native metric
+expressions. The records (`mc_batch_put`, `mc_batch_upsert`) are written to files under
+`/data/pd-diag/logs/mooncake/`, not through glog or stderr; see
+[Native Batch Write Timing](docs/source/getting_started/observability.md#native-batch-write-timing)
+for the file layout, rotation, retention, and the `MC_PD_TIMING` and `PD_DIAG_LEVEL`
+switches.
+
+| `timing_scope` | Measured range |
+| --- | --- |
+| `normal_full` | `StartBatchPut` through `FinalizeBatchPut`, in four phases. Phase 1 includes buffer staging; phase 3 includes `SubmitDfsWrites`. |
+| `prefer_same_node_full` | The prefer-same-node path: phase 1 on the caller side, then grouping/submission, transfer wait, and result propagation/DFS writes/finalization. `total_us` spans phase 1 through finalization. The original-signature `BatchWriteWhenPreferSameNode(ops, is_upsert)` also records this scope, without `phase1_start_batch_put_us` and `total_us`, and with `complete=false`. |
+| `prefer_same_node_not_started` | The configuration check rejected the write before phase 1: `status=error`, `complete=false`, `phase_status=not_started`, keys and bytes, no phase or total durations. |
+
+These host intervals end before result collection and record emission;
+they are not full API latency or additive TTFT components. `submitted_keys` and
+`submitted_bytes` describe operation counts and slice lengths, not successful transfers
+or measured wire traffic.
+Interrupted calls may lack completion records. Clock reads, slice counting, and
+record formatting add overhead; they do not introduce transfers, retries, or device waits.
+
 </details>
 
 ### Mooncake EP and Process Group (PG)
